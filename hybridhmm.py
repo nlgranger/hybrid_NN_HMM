@@ -1,49 +1,61 @@
 import numpy as np
 import tensorflow as tf
 
+from utils import method_scope
 
-class HybridHMM:
-    def __init__(self, posterior, transitions, state_priors=None):
-        self.n_states = len(transitions)
-        self.posterior = posterior
 
-        state_priors = state_priors or np.full([self.n_states], 1 / self.n_states)
+class HybridHMMTransitions:
+    def __init__(self, transitions, init_state_priors, state_priors):
+        # add transitions from virtual initial state
+        n_states = len(transitions)
 
-        with tf.variable_scope("transitions") as scope:
+        with tf.variable_scope(self.__class__.__name__) as scope:
+            self.n_states = n_states
+
+            # Parameters
             self.A = tf.Variable(transitions, dtype='float32', name="A")
-            # self.A_mask = tf.Variable(transitions != 0, dtype='bool', name="A mask")
+            self.init_state_priors = tf.Variable(
+                init_state_priors, dtype='float32', name="init_state_priors")
             self.state_priors = tf.Variable(
                 state_priors, dtype='float32', name="state_priors")
-            self.update_statistics = tf.Variable(
-                np.zeros([self.n_states, self.n_states]),
-                dtype='float32', name="update_statistics")
+
+            # Accumulated statistics
+            self.transition_stats = tf.Variable(
+                np.zeros([n_states, n_states]), dtype='float32', name="transition_stats")
+            self.init_state_stats = tf.Variable(
+                np.zeros([n_states]), dtype='float32', name="transition_stats")
+            self.state_stats = tf.Variable(
+                np.zeros([n_states]), dtype='int64', name="state_stats")
 
             self.scope = scope
 
-    def pseudo_lkh(self, x):
-        return self.posterior(x) / tf.expand_dims(self.state_priors, 0)
+    @method_scope("pseudo_lkh")
+    def pseudo_lkh(self, posteriors):
+        return posteriors / tf.expand_dims(self.state_priors, 0)
 
-    def forward_step(self, alpha_t, pseudo_lkh_tm1):
-        return tf.tensordot(tf.transpose(alpha_t), self.A, 1) * pseudo_lkh_tm1
-
+    @method_scope("forward")
     def forward(self, pseudo_lkh):
         """Compute α terms, including virtual α_0"""
-        alpha_0 = tf.constant([0.] * (self.n_states - 1) + [1.])
+        def forward_step(alpha_t, pseudo_lkh_tm1):
+            return tf.tensordot(tf.transpose(alpha_t), self.A, 1) * pseudo_lkh_tm1
+
+        alpha_1 = self.init_state_priors * pseudo_lkh[0] / self.state_priors
         alpha = tf.scan(
-            self.forward_step,
-            pseudo_lkh,
-            initializer=alpha_0,
+            forward_step,
+            pseudo_lkh[1:],
+            initializer=alpha_1,
             back_prop=False)
-        return tf.concat([tf.expand_dims(alpha_0, 0), alpha], axis=0)
+        return tf.concat([tf.expand_dims(alpha_1, 0), alpha], axis=0)
 
-    def backward_step(self, beta_tp1, pseudo_lkh_tp1):
-        return tf.tensordot(self.A, pseudo_lkh_tp1 * beta_tp1, 1)
-
+    @method_scope("backward")
     def backward(self, pseudo_lkh):
         """Compute β terms"""
+        def backward_step(beta_tp1, pseudo_lkh_tp1):
+            return tf.tensordot(self.A, pseudo_lkh_tp1 * beta_tp1, 1)
+
         beta_T = tf.ones([self.n_states])
         beta = tf.scan(
-            self.backward_step,
+            backward_step,
             pseudo_lkh[1:],
             reverse=True,
             initializer=beta_T,
@@ -57,39 +69,74 @@ class HybridHMM:
         probs = tf.reduce_max(probs, axis=0)
         return probs, path_ptr
 
+    @method_scope("viterbi")
     def viterbi(self, pseudo_lkh):
-        path_proba_0 = tf.ones([self.n_states])
-        path_ptr_0 = tf.constant([self.n_states - 1] * self.n_states, 'int64')
+        path_proba_1 = self.init_state_priors * pseudo_lkh[0] / self.state_priors
+        path_ptr_1 = tf.ones([self.n_states], dtype='int64') * -1
 
         path_proba, path_ptr = tf.scan(
             self.viterbi_step,
             pseudo_lkh,
-            initializer=(path_proba_0, path_ptr_0))
+            initializer=(path_proba_1, path_ptr_1))
 
-        return tf.scan(
+        reverse_path_T = tf.argmax(path_proba[-1])
+        path = tf.scan(
             lambda i, ptrs: ptrs[i],
             path_ptr[1:],
-            initializer=tf.argmax(path_proba[-1]),
+            initializer=reverse_path_T,
             reverse=True)
 
-    def accumulate_updates(self, pseudo_lkh):
+        return tf.concat([path, tf.expand_dims(reverse_path_T, 0)], axis=0)
+
+    @method_scope("add_transition_stats")
+    def add_transition_stats(self, pseudo_lkh):
         alpha = self.forward(pseudo_lkh)
         beta = self.backward(pseudo_lkh)
 
         qty = tf.expand_dims(alpha[:-1], 2) \
             * tf.expand_dims(self.A, 0) \
-            * tf.expand_dims(pseudo_lkh, 1) \
+            * tf.expand_dims(pseudo_lkh[1:], 1) \
             / tf.expand_dims(tf.expand_dims(self.state_priors, 0), 0) \
-            * tf.expand_dims(beta, 1)
+            * tf.expand_dims(beta[1:], 1)
 
-        qty = qty / tf.reduce_sum(qty, [1, 2], keepdims=True)
+        qty = qty / (tf.reduce_sum(qty, [1, 2], keepdims=True) + 1e-4)
+        transition_stats_update = tf.reduce_sum(qty, 0)
 
-        return tf.assign_add(self.update_statistics, tf.reduce_sum(qty, 0))
+        init_state_stats_update = alpha[0] * beta[0]
 
+        return tf.group(
+            tf.assign_add(self.transition_stats, transition_stats_update),
+            tf.assign_add(self.init_state_stats, init_state_stats_update))
+
+    @method_scope("update_transitions")
     def update_transitions(self):
-        A = self.update_statistics \
-            / tf.reduce_sum(self.update_statistics, axis=1, keepdims=True)
-        with tf.control_dependencies([A]):
-            update_statistics = tf.zeros_like(self.update_statistics)
+        A = self.transition_stats \
+            / (tf.reduce_sum(self.transition_stats, axis=1, keepdims=True) + 1e-4)
+        init_state_priors = self.init_state_stats / tf.reduce_sum(self.init_state_stats)
+        with tf.control_dependencies([A, init_state_priors]):
+            return tf.group(
+                tf.assign(self.A, A),
+                tf.assign(self.transition_stats, tf.zeros_like(self.transition_stats)),
+                tf.assign(self.init_state_priors, init_state_priors),
+                tf.assign(self.init_state_stats, tf.zeros_like(self.init_state_stats)))
 
-        return tf.assign(self.A, A), tf.assign(self.update_statistics, update_statistics)
+    @method_scope("add_priors_stats")
+    def add_priors_stats(self, pseudo_lkh):
+        """Align states on given sequence and update their frequencies."""
+        alignment = self.viterbi(pseudo_lkh)
+        matches = tf.equal(tf.expand_dims(alignment, 1),
+                           tf.expand_dims(tf.range(self.n_states, dtype='int64'), 0))
+        counts = tf.reduce_sum(tf.cast(matches, 'int64'), axis=0)
+
+        return tf.assign_add(self.state_stats, counts)
+
+    @method_scope("update_state_priors")
+    def update_state_priors(self):
+        state_priors = (
+            tf.cast(self.state_stats, 'float32')
+            / (tf.cast(tf.reduce_sum(self.state_stats), 'float32')) + 1e-4)
+
+        with tf.control_dependencies([state_priors]):
+            return tf.group(
+                tf.assign(self.state_priors, state_priors),
+                tf.assign(self.state_stats, tf.zeros_like(self.state_stats)))
