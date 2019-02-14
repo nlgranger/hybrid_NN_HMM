@@ -1,6 +1,8 @@
 # Hybrid NN-HMM
 
-This repository contains a Tensorflow implementation of the Hybrid NN-HMM model initially introduced by [(Bourlard & Morgan, 1990)].
+This repository contains a Tensorflow implementation of the Hybrid NN-HMM model initially introduced in:
+
+H. Bourlard and N. Morgan, “A continuous speech recognition system embedding MLP into HMM,” in Advances in neural information processing systems, 1990, pp. 186–193.
 
 ## Demonstration
 
@@ -48,6 +50,3 @@ Start jupyter and open the demo notebook.
 ```
 jupyter notebook
 ```
-
-[(Bourlard & Morgan, 1990)]: H. Bourlard and N. Morgan, “A continuous speech recognition system embedding MLP into HMM,” in Advances in neural information processing systems, 1990, pp. 186–193.
-
