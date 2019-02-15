@@ -42,7 +42,7 @@ source $CONDA_PATH/activate $PWD/venv
 Install the necessary packages:
 
 ```
-conda install jupyter notebook matplotlib numpy tensorflow
+conda install jupyter notebook matplotlib numpy tensorflow scikit-learn
 ```
 
 Start jupyter and open the demo notebook.

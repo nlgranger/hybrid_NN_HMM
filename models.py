@@ -1,7 +1,7 @@
 import tensorflow as tf
 
 
-class SkelFeatureExtractor:
+class FeatureExtractor:
     def __init__(self, output_size):
         with tf.variable_scope("SkelFeatureExtractor") as scope:
             self.dense1 = tf.layers.Dense(16, use_bias=False)
